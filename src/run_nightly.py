@@ -59,11 +59,18 @@ def extract_new(no_wait: bool) -> int:
         return 0
     log(f"{len(pending)} new report(s) to extract.")
 
+    from ingest import file_text_hash, text_hash_seen
+
     ingested = 0
     retries = 0
     i = 0
     while i < len(pending):
         pdf = pending[i]
+        # cheap content-dedup before spending an LLM call on a re-download
+        if text_hash_seen(file_text_hash(pdf)):
+            log(f"  duplicate of an existing note, skipping (no extraction): {pdf.name}")
+            i += 1
+            continue
         try:
             rec = extract_report(str(pdf))
             rid = ingest_record(pdf.name, rec)

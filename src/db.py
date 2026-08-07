@@ -18,7 +18,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS reports (
     id              INTEGER PRIMARY KEY,
     filename        TEXT NOT NULL,
-    content_hash    TEXT NOT NULL UNIQUE,
+    content_hash    TEXT NOT NULL UNIQUE,   -- sha256 of file bytes
+    text_hash       TEXT,                   -- sha256 of extracted text (catches
+                                            -- renamed/re-exported copies)
     report_type     TEXT NOT NULL DEFAULT 'analyst',
     broker          TEXT,
     analyst         TEXT,

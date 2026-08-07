@@ -43,27 +43,25 @@ def new_pdfs() -> list[Path]:
     return out
 
 
-def _is_duplicate_call(rec: dict) -> bool:
-    """True if any of this report's calls already exists (same broker+ticker+
-    report_date+target) — catches renamed/re-exported copies of one note."""
-    calls = rec.get("calls") or []
-    if not calls:
-        return False
-    broker, rdate = rec.get("broker"), rec.get("report_date")
-    conn = connect()
+def file_text_hash(path: Path) -> str | None:
+    """sha256 of the report's extracted text (first 6 pages). Two files with the
+    same content but different bytes (a re-export/rename) share this hash."""
     try:
-        for c in calls:
-            row = conn.execute(
-                """SELECT 1 FROM calls cl JOIN reports r ON r.id=cl.report_id
-                   WHERE r.broker IS ? AND cl.report_date IS ?
-                     AND cl.ticker IS ? AND cl.target_price IS ? LIMIT 1""",
-                (broker, rdate, c.get("ticker"), c.get("target_price")),
-            ).fetchone()
-            if row:
-                return True
+        from extract_text import extract_text
+        return hashlib.sha256(
+            extract_text(str(path), 6).encode("utf-8", "replace")).hexdigest()
+    except Exception:  # noqa: BLE001 - dedup is best-effort
+        return None
+
+
+def text_hash_seen(thash: str | None) -> bool:
+    if not thash:
         return False
-    finally:
-        conn.close()
+    conn = connect()
+    row = conn.execute(
+        "SELECT 1 FROM reports WHERE text_hash=? LIMIT 1", (thash,)).fetchone()
+    conn.close()
+    return row is not None
 
 
 def ingest_record(filename: str, rec: dict) -> int:
@@ -88,19 +86,20 @@ def ingest_record(filename: str, rec: dict) -> int:
     if already_ingested(chash):
         return -1
 
-    # soft dedup: a re-download / rename of the same note has different bytes
-    # (so the hash check misses it) but the same broker+ticker+date+target.
-    if _is_duplicate_call(rec):
+    # content-level dedup: catches a renamed / re-exported copy of a note we
+    # already have (same extracted text, different file bytes).
+    thash = file_text_hash(path)
+    if text_hash_seen(thash):
         return -2
 
     conn = connect()
     cur = conn.execute(
         """INSERT INTO reports
-           (filename, content_hash, report_type, broker, analyst, report_date,
-            parse_status, parse_note, ingested_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (filename, chash, rec.get("report_type", "analyst"), rec.get("broker"),
-         rec.get("analyst"), rec.get("report_date"),
+           (filename, content_hash, text_hash, report_type, broker, analyst,
+            report_date, parse_status, parse_note, ingested_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (filename, chash, thash, rec.get("report_type", "analyst"),
+         rec.get("broker"), rec.get("analyst"), rec.get("report_date"),
          rec.get("parse_status", "ok"), rec.get("parse_note"),
          dt.datetime.now().isoformat(timespec="seconds")),
     )
