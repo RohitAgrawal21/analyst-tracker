@@ -43,6 +43,29 @@ def new_pdfs() -> list[Path]:
     return out
 
 
+def _is_duplicate_call(rec: dict) -> bool:
+    """True if any of this report's calls already exists (same broker+ticker+
+    report_date+target) — catches renamed/re-exported copies of one note."""
+    calls = rec.get("calls") or []
+    if not calls:
+        return False
+    broker, rdate = rec.get("broker"), rec.get("report_date")
+    conn = connect()
+    try:
+        for c in calls:
+            row = conn.execute(
+                """SELECT 1 FROM calls cl JOIN reports r ON r.id=cl.report_id
+                   WHERE r.broker IS ? AND cl.report_date IS ?
+                     AND cl.ticker IS ? AND cl.target_price IS ? LIMIT 1""",
+                (broker, rdate, c.get("ticker"), c.get("target_price")),
+            ).fetchone()
+            if row:
+                return True
+        return False
+    finally:
+        conn.close()
+
+
 def ingest_record(filename: str, rec: dict) -> int:
     """Insert one extracted report (+ its calls or market summary).
 
@@ -64,6 +87,11 @@ def ingest_record(filename: str, rec: dict) -> int:
     chash = file_hash(path)
     if already_ingested(chash):
         return -1
+
+    # soft dedup: a re-download / rename of the same note has different bytes
+    # (so the hash check misses it) but the same broker+ticker+date+target.
+    if _is_duplicate_call(rec):
+        return -2
 
     conn = connect()
     cur = conn.execute(

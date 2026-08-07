@@ -50,7 +50,8 @@ def log(msg: str) -> None:
 
 def extract_new(no_wait: bool) -> int:
     """Extract + ingest every new PDF, with usage-limit backoff. Returns count."""
-    from extract_model import extract_report, UsageLimitError, ExtractionError
+    from extract_model import (extract_report, UsageLimitError, AuthError,
+                               ExtractionError)
 
     pending = ingest.new_pdfs()
     if not pending:
@@ -66,12 +67,21 @@ def extract_new(no_wait: bool) -> int:
         try:
             rec = extract_report(str(pdf))
             rid = ingest_record(pdf.name, rec)
-            log(f"  ingested: {pdf.name}")
-            ingested += 1
+            if rid == -2:
+                log(f"  skipped duplicate (same broker/ticker/date/target): {pdf.name}")
+            else:
+                log(f"  ingested: {pdf.name}")
+                ingested += 1
             i += 1
+        except AuthError as e:
+            # every remaining PDF will fail the same way — park them all and stop.
+            log(f"  claude login expired -> parking {len(pending) - i} report(s). "
+                f"Fix: run `claude` and log in, then re-run. Detail: {e}")
+            _park(pending[i:])
+            break
         except UsageLimitError as e:
             if no_wait or retries >= MAX_LIMIT_RETRIES:
-                log(f"  usage limit — parking remaining {len(pending) - i} report(s).")
+                log(f"  usage limit -> parking remaining {len(pending) - i} report(s).")
                 _park(pending[i:])
                 break
             retries += 1
@@ -79,8 +89,8 @@ def extract_new(no_wait: bool) -> int:
                 f"backing off {BACKOFF_HOURS}h. Detail: {e}")
             time.sleep(BACKOFF_HOURS * 3600)
             # loop again on the same pdf after the wait
-        except ExtractionError as e:
-            log(f"  extraction failed for {pdf.name}: {e} — parking.")
+        except Exception as e:  # noqa: BLE001 - never let one bad PDF kill the run
+            log(f"  extraction failed for {pdf.name}: {type(e).__name__}: {e} -> parking.")
             _park([pdf])
             i += 1
     return ingested
@@ -132,8 +142,9 @@ def main(argv: list[str]) -> None:
     log("=== nightly run start ===")
     try:
         extract_new(no_wait)
-    except ImportError as e:
-        log(f"Extraction unavailable ({e}); refreshing existing data only.")
+    except Exception as e:  # noqa: BLE001 - refresh + publish must still run
+        log(f"Extraction phase error ({type(e).__name__}: {e}); "
+            f"refreshing existing data only.")
     refresh()
     publish(no_publish)
     log("=== nightly run done ===")

@@ -21,6 +21,10 @@ CLAUDE_BIN = shutil.which("claude")
 _LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "limit will reset",
                   "out of usage", "resets at", "upgrade to")
 
+# phrases meaning the headless CLI login has expired (needs interactive re-auth)
+_AUTH_MARKERS = ("oauth session expired", "failed to authenticate", "not logged in",
+                 "please run /login", "authentication_error", "invalid api key")
+
 PROMPT = """You are extracting structured data from one equity research PDF's text.
 
 Return ONLY a single JSON object (no prose, no markdown fences) with this shape:
@@ -67,12 +71,20 @@ REPORT TEXT:
 Return only the JSON object."""
 
 
-class UsageLimitError(RuntimeError):
+class ExtractionError(RuntimeError):
+    pass
+
+
+class UsageLimitError(ExtractionError):
     """Raised when the Claude subscription usage limit blocks extraction."""
 
 
-class ExtractionError(RuntimeError):
-    pass
+class AuthError(ExtractionError):
+    """Raised when the headless `claude` CLI login has expired / is missing.
+
+    Fix: run `claude` interactively once and log in (or `claude /login`), which
+    refreshes the token that `claude -p` reuses.
+    """
 
 
 def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
@@ -90,12 +102,17 @@ def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
 
     low = out.lower()
+    if any(m in low for m in _AUTH_MARKERS):
+        raise AuthError(out.strip()[:400])
     if any(m in low for m in _LIMIT_MARKERS):
         raise UsageLimitError(out.strip()[:400])
     if proc.returncode != 0:
         raise ExtractionError(f"claude exited {proc.returncode}: {out.strip()[:400]}")
 
-    return _parse_json(proc.stdout)
+    try:
+        return _parse_json(proc.stdout)
+    except Exception as e:  # wrap any JSON failure as ExtractionError (fail-safe)
+        raise ExtractionError(f"could not parse model output: {e}") from e
 
 
 def _parse_json(s: str) -> dict:
