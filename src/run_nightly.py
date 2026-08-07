@@ -60,6 +60,7 @@ def extract_new(no_wait: bool) -> int:
     log(f"{len(pending)} new report(s) to extract.")
 
     from ingest import file_text_hash, text_hash_seen
+    from relevance import classify_pdf
 
     ingested = 0
     retries = 0
@@ -69,6 +70,14 @@ def extract_new(no_wait: bool) -> int:
         # cheap content-dedup before spending an LLM call on a re-download
         if text_hash_seen(file_text_hash(pdf)):
             log(f"  duplicate of an existing note, skipping (no extraction): {pdf.name}")
+            i += 1
+            continue
+        # zero-token relevance triage: only company / strict-industry coverage
+        # reaches the LLM; everything else is logged, not extracted.
+        label, reason = classify_pdf(pdf)
+        if label not in ("keep_analyst", "keep_market"):
+            log(f"  filtered [{label}: {reason}] -> {pdf.name}")
+            _log_filtered(pdf.name, label, reason)
             i += 1
             continue
         try:
@@ -101,6 +110,16 @@ def extract_new(no_wait: bool) -> int:
             _park([pdf])
             i += 1
     return ingested
+
+
+FILTERED_LOG = ROOT / "data" / "filtered.log"
+
+
+def _log_filtered(name: str, label: str, reason: str) -> None:
+    """Record a filtered-out file so Rohit can rescue false negatives."""
+    FILTERED_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(FILTERED_LOG, "a", encoding="utf-8") as f:
+        f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M}\t{label}\t{reason}\t{name}\n")
 
 
 def _park(pdfs: list[Path]) -> None:

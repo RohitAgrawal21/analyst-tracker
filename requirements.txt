@@ -3,3 +3,4 @@ pymupdf        # local PDF text extraction (zero-token)
 yfinance       # NSE/BSE price data
 pandas         # data wrangling
 jinja2         # static site templating
+telethon        # Telegram history sync
