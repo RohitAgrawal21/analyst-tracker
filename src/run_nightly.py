@@ -48,6 +48,19 @@ def log(msg: str) -> None:
     print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+def sync_telegram() -> None:
+    """Pull new PDFs from the Telegram group into reports/ (usage-free)."""
+    try:
+        import telegram_sync
+    except Exception as e:  # noqa: BLE001 - telethon not installed etc.
+        log(f"Telegram sync unavailable ({e}); skipping.")
+        return
+    try:
+        telegram_sync.sync(log=log)
+    except Exception as e:  # noqa: BLE001 - never let sync kill the run
+        log(f"Telegram sync error ({type(e).__name__}: {e}); continuing.")
+
+
 def extract_new(no_wait: bool) -> int:
     """Extract + ingest every new PDF, with usage-limit backoff. Returns count."""
     from extract_model import (extract_report, UsageLimitError, AuthError,
@@ -162,17 +175,36 @@ def publish(no_publish: bool) -> None:
         log(f"  publish failed: {e}")
 
 
+LOCK = ROOT / "data" / ".nightly.lock"
+
+
+def _acquire_lock() -> bool:
+    """Prevent two runs (e.g. the backfill task + the daily task) overlapping."""
+    if LOCK.exists() and (time.time() - LOCK.stat().st_mtime) < 13 * 3600:
+        return False
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    LOCK.write_text(str(os.getpid()))
+    return True
+
+
 def main(argv: list[str]) -> None:
     no_wait = "--no-wait" in argv
     no_publish = "--no-publish" in argv
+    if not _acquire_lock():
+        log("another run is active (lock held); exiting.")
+        return
     log("=== nightly run start ===")
     try:
-        extract_new(no_wait)
-    except Exception as e:  # noqa: BLE001 - refresh + publish must still run
-        log(f"Extraction phase error ({type(e).__name__}: {e}); "
-            f"refreshing existing data only.")
-    refresh()
-    publish(no_publish)
+        sync_telegram()
+        try:
+            extract_new(no_wait)
+        except Exception as e:  # noqa: BLE001 - refresh + publish must still run
+            log(f"Extraction phase error ({type(e).__name__}: {e}); "
+                f"refreshing existing data only.")
+        refresh()
+        publish(no_publish)
+    finally:
+        LOCK.unlink(missing_ok=True)
     log("=== nightly run done ===")
 
 

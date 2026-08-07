@@ -2,13 +2,16 @@
 reports/
 *.pdf
 
-# Local database and caches
-data/*.db
-data/*.db-journal
+# All local runtime state: DB, price cache, telegram session/state, logs, temp
+data/
 staging/
+telegram_review/
 __pycache__/
 *.pyc
 .venv/
 
-# Secrets (none needed for v1, but just in case)
+# Secrets
 .env
+telegram_config.json
+*.session
+*.session-journal
