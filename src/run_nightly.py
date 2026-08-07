@@ -193,6 +193,11 @@ def main(argv: list[str]) -> None:
     if not _acquire_lock():
         log("another run is active (lock held); exiting.")
         return
+    try:  # keep the machine awake for the duration of this run
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+    except Exception:  # noqa: BLE001 - non-Windows / no ctypes
+        pass
     log("=== nightly run start ===")
     try:
         sync_telegram()
