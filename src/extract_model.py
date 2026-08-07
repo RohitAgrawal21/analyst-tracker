@@ -1,0 +1,120 @@
+"""Model extraction via headless Claude Code (uses your existing plan, no key).
+
+The nightly job calls `claude -p` with each new report's text and the target
+JSON schema. If the subscription's usage limit is hit, we raise UsageLimitError
+so the runner can back off a few hours and retry (per Rohit's instruction).
+
+Images/graphs are never sent — only the local text layer, trimmed to the first
+few pages where the rating/target/thesis live, to keep it lean.
+"""
+from __future__ import annotations
+import json
+import re
+import shutil
+import subprocess
+
+from extract_text import extract_text
+
+CLAUDE_BIN = shutil.which("claude")
+
+# phrases the Claude Code CLI prints when the subscription limit is reached
+_LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "limit will reset",
+                  "out of usage", "resets at", "upgrade to")
+
+PROMPT = """You are extracting structured data from one equity research PDF's text.
+
+Return ONLY a single JSON object (no prose, no markdown fences) with this shape:
+{
+  "report_type": "analyst" | "market",
+  "broker": "<research house>",
+  "analyst": "<lead analyst name, or the desk name>",
+  "report_date": "YYYY-MM-DD",
+  "parse_status": "ok" | "needs_review",
+  "parse_note": "<why, if needs_review, else omit>",
+  "calls": [ {
+      "ticker": "<NSE symbol>.NS (or .BO for BSE-only)",
+      "company_raw": "<company name as printed>",
+      "sector": "<sector>",
+      "rating": "BUY|ADD|ACCUMULATE|HOLD|NEUTRAL|REDUCE|SELL",
+      "rating_raw": "<as printed>",
+      "rating_action": "initiate|reiterate|upgrade|downgrade",
+      "cmp": <number or null>, "target_price": <number or null>,
+      "prior_target": <number or null>,
+      "horizon_months": <int, default 12>,
+      "thesis": "<2-4 sentence rationale>",
+      "drivers": ["..."], "risks": ["..."],
+      "estimates": {"<label>": "<value>"}
+  } ],
+  "market": {            // include ONLY for report_type=market
+      "theme": "...", "sectors": ["..."], "summary": "...",
+      "outlook": "...", "key_points": ["..."]
+  }
+}
+
+Rules:
+- report_type is "analyst" if it carries a stock rating + target price; "market"
+  for industry/macro/strategy notes. A sector report that also initiates stock
+  coverage is "market" WITH a populated calls[] for those stocks.
+- Resolve the NSE ticker from the company name / codes shown (e.g. BSE code,
+  Bloomberg code). Append .NS.
+- If a field isn't stated, use null; never invent numbers.
+- report_date must be the note's publication date.
+
+REPORT TEXT:
+---
+{TEXT}
+---
+Return only the JSON object."""
+
+
+class UsageLimitError(RuntimeError):
+    """Raised when the Claude subscription usage limit blocks extraction."""
+
+
+class ExtractionError(RuntimeError):
+    pass
+
+
+def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
+    """Extract one report's structured record via headless Claude Code."""
+    if not CLAUDE_BIN:
+        raise ExtractionError("`claude` CLI not found on PATH")
+
+    text = extract_text(pdf_path, max_pages)
+    prompt = PROMPT.replace("{TEXT}", text[:24000])  # hard cap for safety
+
+    proc = subprocess.run(
+        [CLAUDE_BIN, "-p", prompt],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+    low = out.lower()
+    if any(m in low for m in _LIMIT_MARKERS):
+        raise UsageLimitError(out.strip()[:400])
+    if proc.returncode != 0:
+        raise ExtractionError(f"claude exited {proc.returncode}: {out.strip()[:400]}")
+
+    return _parse_json(proc.stdout)
+
+
+def _parse_json(s: str) -> dict:
+    """Pull the first {...} JSON object out of the model's stdout."""
+    s = s.strip()
+    # strip accidental ```json fences
+    s = re.sub(r"^```(?:json)?|```$", "", s, flags=re.M).strip()
+    start = s.find("{")
+    if start == -1:
+        raise ExtractionError(f"no JSON in model output: {s[:200]}")
+    depth, end = 0, None
+    for i in range(start, len(s)):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        raise ExtractionError("unterminated JSON in model output")
+    return json.loads(s[start:end])

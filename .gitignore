@@ -1,0 +1,14 @@
+# Broker PDFs are copyright + bulky: they NEVER go to GitHub. Only extracted data does.
+reports/
+*.pdf
+
+# Local database and caches
+data/*.db
+data/*.db-journal
+staging/
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets (none needed for v1, but just in case)
+.env
