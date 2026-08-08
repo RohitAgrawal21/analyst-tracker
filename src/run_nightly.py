@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -200,35 +201,32 @@ def publish(no_publish: bool) -> None:
 LOCK = ROOT / "data" / ".nightly.lock"
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        import ctypes
-        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
-        if h:
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
-        return False
-    except Exception:  # noqa: BLE001 - if we can't tell, fall back to age check
-        return True
+LOCK_STALE_SECS = 300  # a healthy run heartbeats every 60s; >5min = dead/hung
 
 
 def _acquire_lock() -> bool:
-    """Prevent overlapping runs — but self-heal if the previous run died without
-    releasing the lock (PID-based, so a crashed/slept run never wedges us)."""
+    """Heartbeat lock: a live run refreshes the lock's mtime every 60s. If the
+    lock is older than 5 min, its owner crashed/hung/was recycled -> take over.
+    (mtime-based, so it's immune to PID reuse and to hung-but-alive processes.)"""
     if LOCK.exists():
-        try:
-            pid = int((LOCK.read_text() or "0").strip() or 0)
-        except Exception:  # noqa: BLE001
-            pid = 0
         age = time.time() - LOCK.stat().st_mtime
-        if _pid_alive(pid) and age < 13 * 3600:
-            return False  # a live run holds it
-        log(f"stale lock (pid {pid} not running) — taking over")
+        if age < LOCK_STALE_SECS:
+            return False  # a live run is heartbeating
+        log(f"stale lock ({int(age)}s, no heartbeat) — taking over")
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     LOCK.write_text(str(os.getpid()))
     return True
+
+
+def _start_heartbeat() -> None:
+    def beat():
+        while True:
+            try:
+                LOCK.write_text(str(os.getpid()))
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(60)
+    threading.Thread(target=beat, daemon=True).start()
 
 
 def main(argv: list[str]) -> None:
@@ -237,6 +235,7 @@ def main(argv: list[str]) -> None:
     if not _acquire_lock():
         log("another run is active (lock held); exiting.")
         return
+    _start_heartbeat()
     try:  # keep the machine awake for the duration of this run
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
