@@ -64,11 +64,9 @@ Rules:
 - If a field isn't stated, use null; never invent numbers.
 - report_date must be the note's publication date.
 
-REPORT TEXT:
----
-{TEXT}
----
-Return only the JSON object."""
+The report's extracted text is provided on standard input. Return only the JSON."""
+
+EXTRACT_TIMEOUT = 210  # seconds; a hung claude -p must never block the run
 
 
 class ExtractionError(RuntimeError):
@@ -92,13 +90,18 @@ def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
     if not CLAUDE_BIN:
         raise ExtractionError("`claude` CLI not found on PATH")
 
-    text = extract_text(pdf_path, max_pages)
-    prompt = PROMPT.replace("{TEXT}", text[:24000])  # hard cap for safety
+    # Report text goes via STDIN (not argv) — a 20k-char command-line argument
+    # wedges claude on Windows. The schema/instruction is the -p prompt.
+    text = extract_text(pdf_path, max_pages)[:16000]
 
-    proc = subprocess.run(
-        [CLAUDE_BIN, "-p", prompt],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "-p", PROMPT],
+            input=text, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=EXTRACT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise ExtractionError(f"claude -p timed out after {EXTRACT_TIMEOUT}s")
     out = (proc.stdout or "") + "\n" + (proc.stderr or "")
 
     low = out.lower()

@@ -44,25 +44,41 @@ except Exception:  # noqa: BLE001
     pass
 
 
+LOGFILE = ROOT / "data" / "nightly.log"
+CHECKPOINT_EVERY = 25  # publish progress after this many new extractions
+
+
 def log(msg: str) -> None:
-    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    line = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    print(line, flush=True)
+    try:  # also persist so scheduled runs aren't a black box
+        LOGFILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(LOGFILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def sync_telegram() -> None:
-    """Pull new PDFs from the Telegram group into reports/ (usage-free)."""
+    """Pull new PDFs from the Telegram group into reports/ (usage-free).
+
+    Capped per run so the download phase can never starve extraction (that bug
+    wedged the first overnight run for hours)."""
     try:
         import telegram_sync
     except Exception as e:  # noqa: BLE001 - telethon not installed etc.
         log(f"Telegram sync unavailable ({e}); skipping.")
         return
     try:
-        telegram_sync.sync(log=log)
+        telegram_sync.sync(limit=120, log=log)
     except Exception as e:  # noqa: BLE001 - never let sync kill the run
         log(f"Telegram sync error ({type(e).__name__}: {e}); continuing.")
 
 
-def extract_new(no_wait: bool) -> int:
-    """Extract + ingest every new PDF, with usage-limit backoff. Returns count."""
+def extract_new(no_wait: bool, no_publish: bool) -> int:
+    """Extract + ingest every new PDF, with usage-limit backoff. Returns count.
+    Publishes progress every CHECKPOINT_EVERY extractions so a big backfill shows
+    up on the site as it goes, not only at the very end."""
     from extract_model import (extract_report, UsageLimitError, AuthError,
                                ExtractionError)
 
@@ -101,6 +117,10 @@ def extract_new(no_wait: bool) -> int:
             else:
                 log(f"  ingested: {pdf.name}")
                 ingested += 1
+                if ingested % CHECKPOINT_EVERY == 0:
+                    log(f"  checkpoint at {ingested} extractions -> publishing progress")
+                    refresh()
+                    publish(no_publish)
             i += 1
         except AuthError as e:
             # every remaining PDF will fail the same way — park them all and stop.
@@ -202,7 +222,7 @@ def main(argv: list[str]) -> None:
     try:
         sync_telegram()
         try:
-            extract_new(no_wait)
+            extract_new(no_wait, no_publish)
         except Exception as e:  # noqa: BLE001 - refresh + publish must still run
             log(f"Extraction phase error ({type(e).__name__}: {e}); "
                 f"refreshing existing data only.")
