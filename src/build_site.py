@@ -25,6 +25,61 @@ def _jload(s, default):
         return default
 
 
+_BROKER_SUFFIXES = (
+    " institutional equities", " stock broking limited", " stock broking",
+    " securities (india) ltd.", " securities (india) limited",
+    " securities limited", " securities", " broking limited", " broking",
+    " capital markets", " capital", " research", " asset management",
+    " (india) ltd.", " (india) limited", " ltd.", " ltd", " limited",
+)
+
+
+def norm_broker(b: str | None) -> str:
+    """Collapse naming variants of one house (e.g. 'Nuvama Institutional
+    Equities' and 'Nuvama' -> 'Nuvama') for consistent display + grouping."""
+    if not b or not b.strip() or b.strip().lower() in ("unknown", "none", "null"):
+        return "Unknown"
+    x = b.strip()
+    low = x.lower()
+    for suf in _BROKER_SUFFIXES:
+        if low.endswith(suf):
+            return x[: len(x) - len(suf)].strip() or x
+    return x
+
+
+# Big segments for the market-notes rollup; each maps from keywords found in a
+# report's sectors/theme. Order matters — first match wins.
+_SEGMENTS = [
+    ("Financials / BFSI", ("bank", "nbfc", "insurance", "finance", "financ",
+        "amc", "asset management", "capital market", "broking", "exchange",
+        "rta", "deppositor", "lending", "fintech")),
+    ("Pharma / Healthcare", ("pharma", "health", "hospital", "diagnostic",
+        "life scien", "api ", "drug")),
+    ("IT / Tech", ("information technology", " it ", "software", "tech ",
+        "internet", "digital", "it services")),
+    ("Auto / Ancillaries", ("auto", "vehicle", "tyre", "mobility")),
+    ("Textiles / Apparel", ("textile", "apparel", "garment", "yarn", "fabric")),
+    ("Chemicals", ("chemical", "specialty chem", "agrochem", "fertil")),
+    ("Metals / Mining", ("metal", "steel", "mining", "alumin", "zinc", "copper")),
+    ("Energy / Power / Oil&Gas", ("power", "oil", "gas", "energy", "renewab",
+        "utilit", "coal")),
+    ("Real Estate / Infra", ("real estate", "realty", "infra", "construction",
+        "cement", "capital goods", "industrials", "engineering", "defence",
+        "workspace")),
+    ("Consumer / FMCG / Retail", ("fmcg", "consumer", "retail", "qsr",
+        "hospitality", "food", "beverage", "staples", "discretionary",
+        "electricals", "durables")),
+]
+
+
+def segment_for(text: str) -> str:
+    low = (text or "").lower()
+    for name, keys in _SEGMENTS:
+        if any(k in low for k in keys):
+            return name
+    return "Other / Cross-sector"
+
+
 def load_data() -> dict:
     conn = connect()
     reports = {r["id"]: dict(r) for r in conn.execute("SELECT * FROM reports")}
@@ -38,7 +93,7 @@ def load_data() -> dict:
         calls.append({
             "id": c["id"],
             "analyst": rep.get("analyst") or "Unknown",
-            "broker": rep.get("broker") or "Unknown",
+            "broker": norm_broker(rep.get("broker")),
             "ticker": c["ticker"],
             "company": c["company_raw"],
             "sector": c["sector"],
@@ -70,10 +125,11 @@ def load_data() -> dict:
         "FROM market_reports m JOIN reports r ON r.id=m.report_id"
     ):
         m = dict(m)
+        sectors = _jload(m["sectors_json"], [])
         market.append({
-            "broker": m["broker"], "analyst": m["analyst"],
+            "broker": norm_broker(m["broker"]), "analyst": m["analyst"],
             "date": m["report_date"], "theme": m["theme"],
-            "sectors": _jload(m["sectors_json"], []),
+            "sectors": sectors,
             "summary": m["summary"], "outlook": m["outlook"],
             "key_points": _jload(m["key_points_json"], []),
         })
@@ -82,6 +138,7 @@ def load_data() -> dict:
     analysts = _aggregate(calls, key="analyst")
     brokers = _aggregate(calls, key="broker")
     stocks = _by_stock(calls)
+    segments = _segment_rollup(market)
 
     return {
         "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -89,11 +146,40 @@ def load_data() -> dict:
         "brokers": brokers,
         "stocks": stocks,
         "market": market,
+        "segments": segments,
         "counts": {
             "reports": len(reports), "calls": len(calls),
             "analysts": len(analysts), "market_reports": len(market),
         },
     }
+
+
+def _segment_rollup(market: list[dict]) -> list[dict]:
+    """Group market notes into big segments (Pharma, Auto, Financials, ...).
+    Each segment collects what every contributing report said about it — the
+    raw material for a comprehensive per-segment view. (An LLM synthesis pass
+    can later condense each into one paragraph; grouping is done here token-free.)"""
+    groups: dict[str, list[dict]] = {}
+    for m in market:
+        # a report can touch several segments — file its per-sector views under each
+        seg_hits = {}
+        for s in (m.get("sectors") or []):
+            seg = segment_for(s)
+            seg_hits.setdefault(seg, []).append(s)
+        if not seg_hits:  # fall back to theme
+            seg_hits[segment_for(m.get("theme", ""))] = []
+        for seg, secs in seg_hits.items():
+            groups.setdefault(seg, []).append({
+                "broker": m["broker"], "date": m["date"], "theme": m["theme"],
+                "sectors": secs, "summary": m.get("summary"),
+                "outlook": m.get("outlook"), "key_points": m.get("key_points") or [],
+            })
+    out = [{"segment": seg, "n_reports": len(items),
+            "brokers": sorted({i["broker"] for i in items}),
+            "items": sorted(items, key=lambda i: i["date"] or "", reverse=True)}
+           for seg, items in groups.items()]
+    out.sort(key=lambda s: -s["n_reports"])
+    return out
 
 
 def _aggregate(calls: list[dict], key: str) -> list[dict]:
@@ -106,6 +192,8 @@ def _aggregate(calls: list[dict], key: str) -> list[dict]:
         out.append({
             "name": name,
             **rating,
+            # brokers this analyst has published under (multiple if they moved)
+            "brokers": sorted({r["broker"] for r in rows if r.get("broker")}),
             "calls": sorted(rows, key=lambda r: r["report_date"] or "", reverse=True),
             "flags": _flags(rows, rating),
         })
@@ -272,7 +360,7 @@ $("#sub").textContent =
   `updated ${DATA.generated_at}`;
 
 const TABS=[["analysts","Analysts"],["stocks","Stocks"],["brokers","Brokers"],
-  ["market","Market notes"]];
+  ["market","Market segments"]];
 const tabsEl=$("#tabs");
 TABS.forEach(([k,label])=>{
   const b=document.createElement("div");
@@ -329,6 +417,7 @@ function personCard(a){
     <div class="row" onclick="this.nextElementSibling.classList.toggle('on')">
       <div class="grade ${gcl(a.grade)}">${a.grade}</div>
       <div><div class="nm">${a.name}</div>
+        ${a.brokers&&a.brokers.length&&!(a.brokers.length===1&&a.brokers[0]===a.name)?`<div class="mut" style="color:var(--acc)">${a.brokers.join(' · ')}</div>`:''}
         <div class="mut">${a.confidence} confidence${a.flags.length?' · '+a.flags.map(flagChip).join(''):''}</div></div>
       <div class="spacer"></div>
       <div class="metrics">${m.join("")}</div>
@@ -379,11 +468,35 @@ function marketCard(m){
   </div>`;
 }
 
+function segmentCard(s){
+  return `<div class="card">
+    <div class="row" onclick="this.nextElementSibling.classList.toggle('on')">
+      <div><div class="nm">${s.segment}</div>
+        <div class="mut">${s.brokers.slice(0,5).join(', ')}${s.brokers.length>5?' +'+(s.brokers.length-5):''}</div></div>
+      <div class="spacer"></div>
+      <div class="metric"><div class="v">${s.n_reports}</div><div class="k">reports</div></div>
+    </div>
+    <div class="detail">
+      ${s.synthesis?`<div class="lbl">Comprehensive view</div><div class="thesis">${s.synthesis}</div>`:""}
+      <div class="lbl">What each report says</div>
+      ${s.items.map(it=>`<div class="call">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <b>${it.broker||'?'}</b>
+          <span class="mut">${it.date||''}${it.sectors&&it.sectors.length?' · '+it.sectors.join(', '):''}</span>
+        </div>
+        ${it.summary?`<div class="thesis">${it.summary}</div>`:''}
+        ${it.outlook?`<div class="lbl">Outlook</div><div class="thesis">${it.outlook}</div>`:''}
+        ${it.key_points&&it.key_points.length?`<ul class="tight">${it.key_points.map(p=>`<li>${p}</li>`).join('')}</ul>`:''}
+      </div>`).join("")}
+    </div>
+  </div>`;
+}
+
 function render(){
   const v=$("#view");
   let items=[],html="";
   if(TAB==="analysts"){
-    items=DATA.analysts.filter(a=>a.name.toLowerCase().includes(Q));
+    items=DATA.analysts.filter(a=>(a.name+' '+(a.brokers||[]).join(' ')).toLowerCase().includes(Q));
     html=items.map(personCard).join("");
   }else if(TAB==="brokers"){
     items=DATA.brokers.filter(a=>a.name.toLowerCase().includes(Q));
@@ -393,8 +506,8 @@ function render(){
       (s.ticker||"").toLowerCase().includes(Q));
     html=items.map(stockCard).join("");
   }else{
-    items=DATA.market.filter(m=>((m.theme||"")+(m.broker||"")).toLowerCase().includes(Q));
-    html=items.map(marketCard).join("");
+    items=(DATA.segments||[]).filter(s=>(s.segment+' '+s.brokers.join(' ')).toLowerCase().includes(Q));
+    html=items.map(segmentCard).join("");
   }
   v.innerHTML=html||`<div class="empty">Nothing here yet.</div>`;
 }

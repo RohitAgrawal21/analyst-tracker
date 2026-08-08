@@ -19,7 +19,8 @@ CLAUDE_BIN = shutil.which("claude")
 
 # phrases the Claude Code CLI prints when the subscription limit is reached
 _LIMIT_MARKERS = ("usage limit", "rate limit", "limit reached", "limit will reset",
-                  "out of usage", "resets at", "upgrade to")
+                  "out of usage", "resets at", "upgrade to", "session limit",
+                  "hit your", "you've hit", "resets ", "· resets")
 
 # phrases meaning the headless CLI login has expired (needs interactive re-auth)
 _AUTH_MARKERS = ("oauth session expired", "failed to authenticate", "not logged in",
