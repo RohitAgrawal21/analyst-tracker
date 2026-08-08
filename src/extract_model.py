@@ -68,6 +68,9 @@ Rules:
 The report's extracted text is provided on standard input. Return only the JSON."""
 
 EXTRACT_TIMEOUT = 210  # seconds; a hung claude -p must never block the run
+# Extraction is simple field-pulling — force the cheapest model. Measured ~4x
+# less usage than the default model (which also ran 3 agentic turns per report).
+EXTRACT_MODEL = "claude-haiku-4-5"
 
 
 class ExtractionError(RuntimeError):
@@ -97,7 +100,8 @@ def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
 
     try:
         proc = subprocess.run(
-            [CLAUDE_BIN, "-p", PROMPT],
+            [CLAUDE_BIN, "-p", PROMPT, "--model", EXTRACT_MODEL,
+             "--allowed-tools", ""],  # extraction needs no tools -> less overhead
             input=text, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=EXTRACT_TIMEOUT,
         )
