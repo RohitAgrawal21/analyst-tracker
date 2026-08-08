@@ -72,6 +72,16 @@ EXTRACT_TIMEOUT = 210  # seconds; a hung claude -p must never block the run
 # less usage than the default model (which also ran 3 agentic turns per report).
 EXTRACT_MODEL = "claude-haiku-4-5"
 
+# Batch several reports into ONE call so the fixed per-call agent overhead
+# (~27k tokens) is shared across them — the biggest saving available on the
+# subscription (no API key).
+PROMPT_BATCH = PROMPT.replace(
+    "The report's extracted text is provided on standard input. Return only the JSON.",
+    "MULTIPLE reports are provided on standard input, each delimited by a line "
+    "'===== REPORT <n> ====='. Return a JSON ARRAY with exactly one object per "
+    "report, in the same order, and add an integer field \"_index\" (the report "
+    "number) to each object. Return only the JSON array, nothing else.")
+
 
 class ExtractionError(RuntimeError):
     pass
@@ -121,6 +131,75 @@ def extract_report(pdf_path: str, max_pages: int = 6) -> dict:
         return _parse_json(proc.stdout)
     except Exception as e:  # wrap any JSON failure as ExtractionError (fail-safe)
         raise ExtractionError(f"could not parse model output: {e}") from e
+
+
+def extract_reports_batch(pdf_paths: list[str], max_pages: int = 3) -> list[dict | None]:
+    """Extract several reports in ONE claude call. Returns a list aligned to
+    pdf_paths (None where a report couldn't be parsed). Raises AuthError /
+    UsageLimitError so the caller can park + stop, same as single extraction."""
+    if not CLAUDE_BIN:
+        raise ExtractionError("`claude` CLI not found on PATH")
+    parts = []
+    for i, p in enumerate(pdf_paths, 1):
+        parts.append(f"===== REPORT {i} =====\n{extract_text(p, max_pages)[:9000]}")
+    combined = "\n\n".join(parts)
+
+    try:
+        proc = subprocess.run(
+            [CLAUDE_BIN, "-p", PROMPT_BATCH, "--model", EXTRACT_MODEL,
+             "--allowed-tools", ""],
+            input=combined, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=EXTRACT_TIMEOUT + 60 * len(pdf_paths),
+        )
+    except subprocess.TimeoutExpired:
+        raise ExtractionError("batch claude -p timed out")
+    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    low = out.lower()
+    if any(m in low for m in _AUTH_MARKERS):
+        raise AuthError(out.strip()[:400])
+    if any(m in low for m in _LIMIT_MARKERS):
+        raise UsageLimitError(out.strip()[:400])
+    if proc.returncode != 0:
+        raise ExtractionError(f"claude exited {proc.returncode}: {out.strip()[:300]}")
+
+    result: list[dict | None] = [None] * len(pdf_paths)
+    try:
+        arr = _parse_json_array(proc.stdout)
+    except Exception:  # noqa: BLE001 - malformed array -> caller falls back per-report
+        return result
+    for obj in arr:
+        if not isinstance(obj, dict):
+            continue
+        idx = obj.get("_index")
+        if isinstance(idx, int) and 1 <= idx <= len(pdf_paths):
+            result[idx - 1] = obj
+        else:  # no/invalid index -> next free slot in order
+            for k in range(len(result)):
+                if result[k] is None:
+                    result[k] = obj
+                    break
+    return result
+
+
+def _parse_json_array(s: str) -> list:
+    """Pull the first [...] JSON array out of the model's stdout."""
+    s = re.sub(r"^```(?:json)?|```$", "", s.strip(), flags=re.M).strip()
+    start = s.find("[")
+    if start == -1:
+        raise ExtractionError("no JSON array in output")
+    depth, end = 0, None
+    for i in range(start, len(s)):
+        if s[i] == "[":
+            depth += 1
+        elif s[i] == "]":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end is None:
+        raise ExtractionError("unterminated JSON array")
+    return json.loads(s[start:end])
 
 
 def _parse_json(s: str) -> dict:

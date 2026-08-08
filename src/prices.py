@@ -23,7 +23,8 @@ def _yf_download(ticker: str, start: str, end: str) -> pd.DataFrame:
     """Raw daily OHLC from yfinance. Empty frame on failure (never raises)."""
     try:
         df = yf.download(
-            ticker, start=start, end=end, progress=False, auto_adjust=True
+            ticker, start=start, end=end, progress=False, auto_adjust=True,
+            timeout=20, threads=False,  # never let a slow fetch hang the run
         )
         if df is None or df.empty:
             return pd.DataFrame()
