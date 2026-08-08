@@ -220,12 +220,13 @@ def main(argv: list[str]) -> None:
         pass
     log("=== nightly run start ===")
     try:
-        sync_telegram()
+        # Extract the already-downloaded backlog FIRST (visible progress); pull
+        # new PDFs from Telegram afterwards so downloads never starve extraction.
         try:
             extract_new(no_wait, no_publish)
-        except Exception as e:  # noqa: BLE001 - refresh + publish must still run
-            log(f"Extraction phase error ({type(e).__name__}: {e}); "
-                f"refreshing existing data only.")
+        except Exception as e:  # noqa: BLE001 - sync/publish must still run
+            log(f"Extraction phase error ({type(e).__name__}: {e}); continuing.")
+        sync_telegram()
         refresh()
         publish(no_publish)
     finally:
